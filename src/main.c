@@ -8,6 +8,7 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/drivers/gpio.h>
 
 #include "display.h"
 #include "buzzer.h"
@@ -19,6 +20,9 @@
 #define THREAD_PRIORITY   5
 
 LOG_MODULE_REGISTER(temp_alarm, LOG_LEVEL_INF);
+
+/* Demo only: the application drives the buzzer pin itself, bypassing the buzzer module. */
+static const struct gpio_dt_spec buzzer_pin = GPIO_DT_SPEC_GET(DT_ALIAS(buzzer), gpios);
 
 /* The shared atomic flag: true when temp ≥ threshold */
 atomic_t alarm_flag = ATOMIC_INIT(0);
@@ -124,6 +128,7 @@ static void noreturn temp_thread_fn (void * arg1, void * arg2, void * arg3)
     if (above && (atomic_get(&alarm_flag) == 0))
     {
       atomic_set(&alarm_flag, 1);
+      (void)gpio_pin_set_dt(&buzzer_pin, 1);
       LOG_WRN("Threshold reached");
     }
     else if (!above && (atomic_get(&alarm_flag) != 0))

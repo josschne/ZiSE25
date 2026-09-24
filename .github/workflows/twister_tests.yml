@@ -8,6 +8,8 @@ env:
   GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
 jobs:
   Test:
+    # Needs BUGSENG's ECLAIR runner; skipped in forks (see open_reproduction.yml).
+    if: github.repository == 'BUGSENG/ZiSE25'
     runs-on: saas.eclairit.com
     container:
       image: ubuntu:24.04

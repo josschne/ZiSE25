@@ -9,6 +9,8 @@ name: "Open reproduction (no ECLAIR)"
 
 on:
   push:
+    # Demo branches run only as pull requests, where the stand-ins compare against the base.
+    branches: [main, open-reproduction]
     paths-ignore:
       - 'README.md'
   pull_request:
@@ -67,7 +69,7 @@ jobs:
           mkdir -p "$RESULTS"
           {
             echo "commit: $(git -C temp_alert rev-parse HEAD)"
-            echo "zephyr: $(git -C deps/zephyr describe --tags)"
+            echo "zephyr: $(west list zephyr -f '{revision} ({sha})')"
             echo "gcc: $(gcc --version | head -1)"
             echo "cppcheck: $(cppcheck --version)"
             echo "ctags: $(ctags --version | head -1)"
@@ -143,13 +145,13 @@ jobs:
           B=""; [ -f baseline/arch/arch_uses.json ] && B="--baseline baseline/arch/arch_uses.json"
           python3 temp_alert/open-ci/open_arch_check.py build_app "$RESULTS/arch" --app-dir temp_alert $B
 
-      - name: "Stand-in: requirements traceability tags, not ECLAIR"
+      - name: "Stand-in: requirements traceability tags, not ECLAIR (report only)"
         id: trace
-        continue-on-error: true
         run: |
           set -eu
           . .venv/bin/activate
-          python3 temp_alert/open-ci/open_trace_check.py "$RESULTS/trace" --app-dir temp_alert
+          python3 temp_alert/open-ci/open_trace_check.py "$RESULTS/trace" --app-dir temp_alert || \
+            echo "::notice title=Traceability gaps::Reported in the trace report; not gating."
 
       - name: Report site and job summary
         if: always()

@@ -1,0 +1,212 @@
+name: "Open reproduction (no ECLAIR)"
+
+# Reproduces ZiSE25's CI outputs on GitHub-hosted runners with open-source tools.
+# Same tools as upstream: twister tests and gcovr coverage on native_sim, StrictDoc
+# export, scripts/check_requirements.py. Open-source stand-ins for the ECLAIR steps:
+# cppcheck's MISRA C:2012 addon, an architecture check that reads ECLAIR/architecture.ecl,
+# and a traceability check of @implements/@tests tags. The stand-ins are NOT ECLAIR.
+# See open-ci/README.md.
+
+on:
+  push:
+    paths-ignore:
+      - 'README.md'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: open-reproduction-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZEPHYR_TOOLCHAIN_VARIANT: host
+  APP: temp_alert
+  RESULTS: ${{ github.workspace }}/results
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (as the west manifest repository)
+        uses: actions/checkout@v4
+        with:
+          path: temp_alert
+          fetch-depth: 0
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build gperf device-tree-compiler \
+            gcc-multilib g++-multilib python3-venv python3-dev file libmagic1 \
+            cppcheck universal-ctags
+
+      - name: Cache Zephyr
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: zephyr-${{ hashFiles('temp_alert/west.yml') }}
+
+      - name: West workspace and Python packages
+        run: |
+          set -eu
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip wheel
+          pip install west==1.5.0 pyelftools==0.33 gcovr==8.6 strictdoc==0.30.1
+          west init -l --mf west.yml temp_alert || true
+          west update --narrow -o=--depth=1
+          west zephyr-export
+          grep -vE '^(cbor|pyocd|python-can)' deps/zephyr/scripts/requirements-run-test.txt > run-test.txt
+          pip install -r deps/zephyr/scripts/requirements-base.txt \
+                      -r deps/zephyr/scripts/requirements-build-test.txt -r run-test.txt
+          mkdir -p "$RESULTS"
+          {
+            echo "commit: $(git -C temp_alert rev-parse HEAD)"
+            echo "zephyr: $(git -C deps/zephyr describe --tags)"
+            echo "gcc: $(gcc --version | head -1)"
+            echo "cppcheck: $(cppcheck --version)"
+            echo "ctags: $(ctags --version | head -1)"
+            pip list 2>/dev/null | grep -Ei '^(west|gcovr|strictdoc|pyelftools) '
+          } > "$RESULTS/versions.txt"
+          cat "$RESULTS/versions.txt"
+
+      - name: Tests and coverage (same command as upstream, plus HTML coverage)
+        working-directory: temp_alert
+        run: |
+          set -eu
+          . ../.venv/bin/activate
+          west twister -T tests --coverage --coverage-basedir . --coverage-formats html \
+            --platform native_sim --outdir ../twister-out
+          mkdir -p "$RESULTS/twister"
+          cp -r ../twister-out/coverage "$RESULTS/twister/"
+          cp ../twister-out/{twister.json,twister.xml,twister_report.xml,twister_suite_report.xml,testplan.json,twister.log,coverage_summary.json} \
+             "$RESULTS/twister/" 2>/dev/null || true
+
+      - name: Requirements document (StrictDoc, same as upstream)
+        working-directory: temp_alert
+        run: |
+          set -eu
+          . ../.venv/bin/activate
+          strictdoc export --formats=html temp_alert.sdoc --output-dir "$RESULTS/strictdoc"
+
+      - name: Requirements hierarchy check (upstream script)
+        id: reqcheck
+        working-directory: temp_alert
+        continue-on-error: true
+        run: |
+          set -eu
+          . ../.venv/bin/activate
+          ./scripts/check_requirements.py temp_alert.sdoc 2>&1 | tee "$RESULTS/check_requirements.txt"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Build the app for native_sim (compile commands for the stand-ins)
+        run: |
+          set -eu
+          . .venv/bin/activate
+          west build -p -b native_sim -d build_app temp_alert -- \
+            -DDTC_OVERLAY_FILE=tests/test_temp_alert/boards/native_sim.overlay \
+            -DEXTRA_CONF_FILE="$PWD/temp_alert/open-ci/native_sim_extra.conf" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Baseline from the pull request base
+        if: github.event_name == 'pull_request'
+        run: |
+          set -eu
+          . .venv/bin/activate
+          git -C temp_alert worktree add "$PWD/base" "${{ github.event.pull_request.base.sha }}"
+          # The stand-in scripts come from this branch, so the base does not need them.
+          west build -p -b native_sim -d build_base base -- \
+            -DDTC_OVERLAY_FILE=tests/test_temp_alert/boards/native_sim.overlay \
+            -DEXTRA_CONF_FILE="$PWD/temp_alert/open-ci/native_sim_extra.conf" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          python3 temp_alert/open-ci/open_misra_check.py build_base baseline/misra --app-dir base || true
+          python3 temp_alert/open-ci/open_arch_check.py build_base baseline/arch --app-dir base || true
+
+      - name: "Stand-in: MISRA (cppcheck), not ECLAIR"
+        id: misra
+        continue-on-error: true
+        run: |
+          set -eu
+          B=""; [ -f baseline/misra/misra_findings.json ] && B="--baseline baseline/misra/misra_findings.json"
+          python3 temp_alert/open-ci/open_misra_check.py build_app "$RESULTS/misra" --app-dir temp_alert $B
+
+      - name: "Stand-in: architecture rules from architecture.ecl, not ECLAIR"
+        id: arch
+        continue-on-error: true
+        run: |
+          set -eu
+          B=""; [ -f baseline/arch/arch_uses.json ] && B="--baseline baseline/arch/arch_uses.json"
+          python3 temp_alert/open-ci/open_arch_check.py build_app "$RESULTS/arch" --app-dir temp_alert $B
+
+      - name: "Stand-in: requirements traceability tags, not ECLAIR"
+        id: trace
+        continue-on-error: true
+        run: |
+          set -eu
+          . .venv/bin/activate
+          python3 temp_alert/open-ci/open_trace_check.py "$RESULTS/trace" --app-dir temp_alert
+
+      - name: Report site and job summary
+        if: always()
+        run: |
+          set -eu
+          [ -f "$RESULTS/misra/misra_new_findings.json" ] && \
+            python3 -c "import json,sys;[print(f\"NEW MISRA Rule {n['rule']} in {n['file']} (+{n['added']})\") for n in json.load(open(sys.argv[1]))]" \
+              "$RESULTS/misra/misra_new_findings.json" >> "$RESULTS/new_findings.txt" || true
+          grep '^  NEW ' "$RESULTS/arch/arch_summary.txt" >> "$RESULTS/new_findings.txt" 2>/dev/null || true
+          python3 temp_alert/open-ci/make_site.py "$RESULTS" site
+          {
+            echo "## ZiSE25 open reproduction"
+            echo "Stand-ins are open-source approximations, not ECLAIR."
+            echo '```'
+            cat "$RESULTS/versions.txt"
+            echo
+            cat "$RESULTS/misra/misra_summary.txt" 2>/dev/null || true
+            cat "$RESULTS/arch/arch_summary.txt" 2>/dev/null || true
+            cat "$RESULTS/trace/trace_summary.txt" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-reproduction-${{ github.sha }}
+          path: site
+          retention-days: 90
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Gate
+        if: always()
+        run: |
+          fail=0
+          [ "${{ steps.reqcheck.outcome }}" = "failure" ] && { echo "check_requirements.py failed"; fail=1; }
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            [ "${{ steps.misra.outcome }}" = "failure" ] && { echo "New MISRA stand-in findings"; fail=1; }
+            [ "${{ steps.arch.outcome }}" = "failure" ] && { echo "New architecture stand-in findings"; fail=1; }
+          fi
+          exit $fail
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: reproduce
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

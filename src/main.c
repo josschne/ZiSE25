@@ -131,10 +131,6 @@ static void noreturn temp_thread_fn (void * arg1, void * arg2, void * arg3)
       atomic_set(&alarm_flag, 0);
       LOG_INF("Back below threshold");
     }
-    else
-    {
-      /* No threshold crossing detected; maintain current alarm_flag. */
-    }
 
     k_sleep(K_SECONDS(1));
   }
